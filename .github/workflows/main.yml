@@ -128,16 +128,29 @@ jobs:
       # -e DATABASE_TEST_URL  → base de datos SQLite para los tests
       # -p 5003:8765          → mapea puerto 8765 del contenedor al 5003 del host
       - name: Run container
-        run: |
-          docker run \
-            -d \
-            --name fastapi-tdd \
-            -e PORT=8765 \
-            -e ENVIRONMENT=dev \
-            -e DATABASE_URL=sqlite://sqlite.db \
-            -e DATABASE_TEST_URL=sqlite://sqlite.db \
-            -p 5003:8765 \
-            ${{ env.IMAGE }}-final:latest
+              run: |
+                docker network create test-network
+
+                docker run -d \
+                  --name postgres \
+                  --network test-network \
+                  -e POSTGRES_USER=postgres \
+                  -e POSTGRES_PASSWORD=postgres \
+                  -e POSTGRES_DB=test_db \
+                  postgres:15-alpine
+
+                sleep 3
+
+                docker run \
+                  -d \
+                  --name fastapi-tdd \
+                  --network test-network \
+                  -e PORT=8765 \
+                  -e ENVIRONMENT=dev \
+                  -e DATABASE_URL=postgres://postgres:postgres@postgres:5432/summarizer \
+                  -e DATABASE_TEST_URL=postgres://postgres:postgres@postgres:5432/test_db \
+                  -p 5003:8765 \
+                  ${{ env.IMAGE }}-final:latest
 
       # Instala las herramientas de testing DENTRO del contenedor en ejecución
       # Se usan versiones fijas (pinned) para garantizar reproducibilidad
