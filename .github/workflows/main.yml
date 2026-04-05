@@ -1,33 +1,60 @@
+# Nombre del workflow, aparece en la pestaña "Actions" de GitHub
 name: Continuous Integration and Delivery
 
-on:
-  push:
-    branches:
-      - main
-      - develop
+# Disparador: se ejecuta en cada push a cualquier rama
+on: [push]
 
+# Habilito permisos específicos para el token GITHUB_TOKEN que se usa en los jobs
+permissions:          # ← nivel global
+  contents: read
+  packages: write
+
+# Variable global disponible en todos los jobs
 env:
-  IMAGE: ghcr.io/${{ github.repository_owner }}/summarizer
+  # Construye la ruta de la imagen en GitHub Container Registry (GHCR)
+  # Convierte el nombre del repo a minúsculas (requerido por Docker)
+  # Resultado ejemplo: ghcr.io/miusuario/summarizer
+  IMAGE: ghcr.io/$(echo $GITHUB_REPOSITORY | tr '[A-Z]' '[a-z]')/summarizer
 
 jobs:
 
+  # ─────────────────────────────────────────────
+  # JOB 1: Construir la imagen Docker
+  # ─────────────────────────────────────────────
   build:
     name: Build Docker Image
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-latest        # Corre en una VM Ubuntu limpia de GitHub
     steps:
+
+      # Descarga el código del repo en la VM
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: main               # Siempre toma el código de la rama main
 
+      # Se autentica en GHCR para poder subir/bajar imágenes
+      # GITHUB_TOKEN es generado automáticamente por GitHub Actions, no hay que crearlo
       - name: Log in to GitHub Packages
         run: echo ${GITHUB_TOKEN} | docker login -u ${GITHUB_ACTOR} --password-stdin ghcr.io
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Pull images (cache)
+      # Intenta bajar las imágenes ya publicadas para usarlas como caché
+      # El "|| true" evita que falle si las imágenes no existen todavía (primer deploy)
+      - name: Pull images
         run: |
           docker pull ${{ env.IMAGE }}-builder:latest || true
           docker pull ${{ env.IMAGE }}-final:latest || true
 
+      # Construye dos imágenes usando Dockerfile.prod con multi-stage build:
+      #
+      # IMAGEN 1 (*-builder): etapa intermedia con compiladores y dependencias de build.
+      #   --target builder     → se detiene en la etapa "builder" del Dockerfile
+      #   --cache-from         → reutiliza capas de la imagen descargada (más rápido)
+      #
+      # IMAGEN 2 (*-final): imagen liviana lista para producción.
+      #   Sin --target         → usa todas las etapas, resultado final optimizado
+      #   --cache-from         → reutiliza capas de la imagen builder y final anteriores
       - name: Build images
         run: |
           docker build \
@@ -42,18 +69,32 @@ jobs:
             --file ./project/Dockerfile.prod \
             "./project"
 
+      # Sube ambas imágenes a GHCR con tag "latest"
+      # Quedan disponibles para el job "test" y para Render en el deploy
       - name: Push images
         run: |
           docker push ${{ env.IMAGE }}-builder:latest
           docker push ${{ env.IMAGE }}-final:latest
 
+
+  # ─────────────────────────────────────────────
+  # JOB 2: Testear la imagen Docker
+  # Solo corre si el job "build" fue exitoso
+  # ─────────────────────────────────────────────
   test:
     name: Test Docker Image
     runs-on: ubuntu-latest
-    needs: build
+    needs: build                  # Depende de que "build" haya pasado
+
     steps:
+
+      # Mismos pasos iniciales que en build:
+      # checkout + login + pull + build local de la imagen
+      # (necesario porque cada job corre en una VM nueva y limpia)
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: main
 
       - name: Log in to GitHub Packages
         run: echo ${GITHUB_TOKEN} | docker login -u ${GITHUB_ACTOR} --password-stdin ghcr.io
@@ -79,6 +120,13 @@ jobs:
             --file ./project/Dockerfile.prod \
             "./project"
 
+      # Levanta un contenedor en background (-d) con la imagen final
+      # --name fastapi-tdd    → nombre para referenciarlo en los pasos siguientes
+      # -e PORT=8765          → puerto interno donde escucha FastAPI
+      # -e ENVIRONMENT=dev    → modo desarrollo (habilita recarga, logs, etc.)
+      # -e DATABASE_URL       → base de datos SQLite para la app
+      # -e DATABASE_TEST_URL  → base de datos SQLite para los tests
+      # -p 5003:8765          → mapea puerto 8765 del contenedor al 5003 del host
       - name: Run container
         run: |
           docker run \
@@ -91,39 +139,72 @@ jobs:
             -p 5003:8765 \
             ${{ env.IMAGE }}-final:latest
 
-      - name: Install test dependencies
+      # Instala las herramientas de testing DENTRO del contenedor en ejecución
+      # Se usan versiones fijas (pinned) para garantizar reproducibilidad
+      # - pytest:  framework de tests
+      # - flake8:  linter, detecta errores y malas prácticas (PEP8)
+      # - black:   formateador automático de código
+      # - isort:   ordena los imports alfabéticamente y por tipo
+      - name: Install requirements
         run: docker exec fastapi-tdd python3 -m pip install black==25.1.0 flake8==7.2.0 isort==6.0.1 pytest==8.3.5
 
+      # Corre todos los tests del proyecto dentro del contenedor
+      # Si algún test falla → el job falla y el deploy NO se ejecuta
       - name: Pytest
         run: docker exec fastapi-tdd python -m pytest .
 
+      # Verifica estilo de código según PEP8
+      # Detecta: líneas largas, espacios incorrectos, imports no usados, etc.
       - name: Flake8
         run: docker exec fastapi-tdd python -m flake8 .
 
+      # Verifica que el código esté formateado con Black
+      # --check: solo reporta diferencias, no modifica archivos
+      # Si hay algo sin formatear → falla
       - name: Black
         run: docker exec fastapi-tdd python -m black . --check
 
+      # Verifica que los imports estén ordenados correctamente
+      # --check-only: solo reporta, no reordena
       - name: isort
         run: docker exec fastapi-tdd python -m isort . --check-only
 
+
+  # ─────────────────────────────────────────────
+  # JOB 3a: Deploy a Staging
+  # Solo corre si el push fue a la rama "develop"
+  # Y si build + test pasaron
+  # ─────────────────────────────────────────────
   deploy-staging:
     name: Deploy to Staging (Render)
     runs-on: ubuntu-latest
-    needs: [build, test]
-    if: github.ref == 'refs/heads/develop'
+    needs: [build, test]          # Depende de que ambos jobs anteriores hayan pasado
+    if: github.ref == 'refs/heads/develop'   # Solo se ejecuta en la rama develop
+
     steps:
+      # Llama al Deploy Hook de Render via HTTP POST
+      # Render recibe la señal y redesplega el servicio de staging automáticamente
+      # grep verifica que la respuesta sea 200/201/202 (éxito), sino falla el step
       - name: Trigger Render staging deploy
         run: |
           curl -s -o /dev/null -w "%{http_code}" \
             --request POST \
             "${{ secrets.RENDER_STAGING_DEPLOY_HOOK }}" | grep -q "200\|201\|202"
 
+
+  # ─────────────────────────────────────────────
+  # JOB 3b: Deploy a Producción
+  # Solo corre si el push fue a la rama "main"
+  # Y si build + test pasaron
+  # ─────────────────────────────────────────────
   deploy-production:
     name: Deploy to Production (Render)
     runs-on: ubuntu-latest
-    needs: [build, test]
-    if: github.ref == 'refs/heads/main'
+    needs: [build, test]          # Depende de que ambos jobs anteriores hayan pasado
+    if: github.ref == 'refs/heads/main'      # Solo se ejecuta en la rama main
+
     steps:
+      # Igual que staging pero dispara el hook del servicio de producción
       - name: Trigger Render production deploy
         run: |
           curl -s -o /dev/null -w "%{http_code}" \
