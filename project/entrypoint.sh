@@ -1,13 +1,11 @@
 #!/bin/sh
 
-echo "Waiting for postgres..."
-
-DB_HOST=$(echo $DATABASE_URL | sed 's/.*@\(.*\):.*/\1/')
-
-while ! nc -z $DB_HOST 5432; do
-  sleep 0.1
-done
-
-echo "PostgreSQL started"
+if [ "$ENVIRONMENT" = "dev" ]; then
+    echo "Waiting for postgres..."
+    while ! nc -z web-db 5432; do
+        sleep 0.1
+    done
+    echo "PostgreSQL started"
+fi
 
 exec "$@"
