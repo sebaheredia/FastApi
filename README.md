@@ -13,4 +13,4 @@ Este workflow de GitHub Actions se ejecuta automáticamente en cada `push` al re
 
 ### Variables globales
 
-Antes de correr cualquier job, el workflow define la variable `IMAGE` con la ruta de la imagen Docker en GitHub Container Registry (GHCR), construida a partir del nombre del repositorio en minúsculas:
+Antes de correr cualquier job, el workflow define la variable `IMAGE` con la ruta de la imagen Docker en GitHub Container Registry (GHCR), construida a partir del nombre del repositorio en minúsculas: 
